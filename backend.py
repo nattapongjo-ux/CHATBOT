@@ -7,9 +7,14 @@ import time
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from google.api_core.exceptions import ResourceExhausted, InternalServerError # เพิ่มตัวนี้เข้ามา
 
 # ================= Config =================
-MODEL_NAME = 'gemini-2.0-flash-lite'
+# โมเดลหลัก (เร็วแรง)
+PRIMARY_MODEL = 'gemini-2.0-flash-lite-preview-02-05' 
+# โมเดลสำรอง (เสถียร) - ใช้เมื่อตัวหลักโควตาเต็ม
+BACKUP_MODEL = 'gemini-1.5-flash'
+
 GENERATION_CONFIG = {
     "temperature": 0.3,
     "top_p": 0.8,
@@ -36,7 +41,6 @@ def get_drive_service():
         return None
 
 def _download_single_file(file_id, service, file_name):
-    """ดาวน์โหลดไฟล์ 1 ไฟล์"""
     try:
         request = service.files().get_media(fileId=file_id)
         file_io = io.BytesIO()
@@ -49,73 +53,41 @@ def _download_single_file(file_id, service, file_name):
     except Exception as e:
         return f"Error reading {file_name}: {e}\n"
 
-# ================= ✨ ฟังก์ชันใหม่: สร้างแผนที่ชื่อจังหวัด -> ID =================
-@st.cache_data(ttl=3600) # จำค่าไว้ 1 ชั่วโมง จะได้ไม่ต้องโหลดบ่อยๆ
+# ================= Province Map Logic =================
+@st.cache_data(ttl=3600)
 def get_province_map(root_folder_id):
-    """
-    ไปสแกน Root Folder แล้วสร้างคู่มือ: {'เชียงราย': 'ID_1', 'น่าน': 'ID_2'}
-    """
     service = get_drive_service()
     if not service: return {}
-    
     try:
-        # หา Folder ทั้งหมดที่อยู่ใน Root
         query = f"'{root_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        results = service.files().list(
-            q=query, pageSize=100, fields="files(id, name)"
-        ).execute()
-        
-        folders = results.get('files', [])
-        
-        # สร้าง Dictionary เก็บค่า {'ชื่อจังหวัด': 'ID'}
-        # ตัดช่องว่างออกเพื่อให้หาง่าย (เช่น " เชียงราย " -> "เชียงราย")
-        province_map = {f['name'].strip(): f['id'] for f in folders}
-        return province_map
-        
+        results = service.files().list(q=query, pageSize=100, fields="files(id, name)").execute()
+        return {f['name'].strip(): f['id'] for f in results.get('files', [])}
     except Exception as e:
         print(f"Error mapping provinces: {e}")
         return {}
 
-# ================= Logic ค้นหาแบบฉลาด (Smart Router) =================
 def find_relevant_files(root_folder_id, user_query):
     service = get_drive_service()
     if not service: return []
-
-    # 1. โหลดแผนที่จังหวัดมาก่อน (เชียงราย=IDอะไร, น่าน=IDอะไร)
-    province_map = get_province_map(root_folder_id)
     
-    # 2. ตรวจสอบว่าในคำถาม มีชื่อจังหวัดหลุดมาไหม?
+    province_map = get_province_map(root_folder_id)
     target_folder_ids = []
     detected_provinces = []
     
     for prov_name, prov_id in province_map.items():
-        # ถ้าชื่อจังหวัด (เช่น 'น่าน') ปรากฏอยู่ในคำถาม user
         if prov_name in user_query:
             target_folder_ids.append(prov_id)
             detected_provinces.append(prov_name)
     
-    # แจ้งเตือน user นิดหน่อยว่าบอทเจอจังหวัดนะ (Debug)
-    if detected_provinces:
-        st.toast(f"📍 กำลังค้นข้อมูลในโฟลเดอร์: {', '.join(detected_provinces)}")
-    
-    # 3. กำหนดเป้าหมายการค้นหา
     files_found = []
-    
     if target_folder_ids:
-        # กรณี A: เจอชื่อจังหวัด -> ค้นแค่ในโฟลเดอร์จังหวัดนั้นๆ (แม่นยำ 100%)
+        # st.toast(f"📍 เจอจังหวัด: {', '.join(detected_provinces)}")
         for fid in target_folder_ids:
-            # หาไฟล์ Text ในโฟลเดอร์นั้น
             q = f"'{fid}' in parents and mimeType = 'text/plain' and trashed = false"
             res = service.files().list(q=q, pageSize=10, fields="files(id, name)").execute()
             files_found.extend(res.get('files', []))
     else:
-        # กรณี B: ไม่เจอชื่อจังหวัด -> ค้นหาแบบกว้าง (Keyword Search) ใน Root
-        # หรือจะให้ดีคือ ค้นหาไฟล์ที่มีชื่อตรงกับ Keyword ในโฟลเดอร์ลูกทั้งหมด (อาจจะช้าหน่อย)
-        # เพื่อความเร็ว เอาแค่หาไฟล์ที่มีชื่อตรงกับ Query ก็พอ
-        st.toast("🔎 ไม่ระบุจังหวัด กำลังค้นหาจากชื่อไฟล์...")
-        
-        # ค้นหาไฟล์ที่มีชื่อตรงกับคำถาม (name contains '...')
-        # หมายเหตุ: Drive API ค้นภาษาไทยใน 'name contains' ไม่ค่อยเก่ง แตพอลองดูได้
+        # st.toast("🔎 ค้นหาจากชื่อไฟล์...")
         clean_query = user_query.replace("ราคา", "").replace("ข้อมูล", "").strip()
         if clean_query:
             q = f"name contains '{clean_query}' and mimeType = 'text/plain' and trashed = false"
@@ -124,15 +96,30 @@ def find_relevant_files(root_folder_id, user_query):
 
     return files_found
 
+# ================= Helper: เรียก Gemini แบบปลอดภัย =================
+def _generate_content_safe(prompt, stream=False):
+    """
+    ฟังก์ชันนี้จะลองใช้รุ่น Lite ก่อน ถ้าโควตาเต็ม จะสลับไปใช้รุ่นปกติให้อัตโนมัติ
+    """
+    try:
+        # รอบที่ 1: ลองใช้รุ่น Lite (เร็วสุด)
+        model = genai.GenerativeModel(PRIMARY_MODEL)
+        return model.generate_content(prompt, stream=stream, generation_config=GENERATION_CONFIG)
+    
+    except (ResourceExhausted, InternalServerError):
+        # รอบที่ 2: ถ้า Error (โควตาเต็ม/ล่ม) -> สลับไปใช้รุ่น Backup
+        # st.toast("⚠️ รุ่น Lite โควตาเต็ม กำลังสลับไปใช้รุ่นมาตรฐาน...", icon="🔄")
+        time.sleep(1) # พักหายใจ 1 วิ
+        model = genai.GenerativeModel(BACKUP_MODEL)
+        return model.generate_content(prompt, stream=stream, generation_config=GENERATION_CONFIG)
+
 # ================= Chat Logic =================
 def ask_gemini_stream(file_list, question, timer_placeholder=None):
     service = get_drive_service()
-    
     if not file_list:
-        yield "ไม่พบเอกสารที่ตรงกับคำค้นหาในโฟลเดอร์ครับ ลองระบุชื่อจังหวัดให้ชัดเจนอีกนิดนะครับ"
+        yield "ไม่พบเอกสารที่ตรงกับคำค้นหาในโฟลเดอร์ครับ"
         return
 
-    # Parallel Download
     downloaded_texts = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_file = {
@@ -143,28 +130,22 @@ def ask_gemini_stream(file_list, question, timer_placeholder=None):
             downloaded_texts.append(future.result())
 
     full_context = "\n".join(downloaded_texts)
+    prompt = f"Context:\n{full_context}\n\nQuestion: {question}\nAnswer based on context:"
     
-    prompt = f"""
-    Context: ข้อมูลเกษตรรายจังหวัด
-    Task: ตอบคำถามโดยอ้างอิงข้อมูลด้านล่างนี้
-    
-    ข้อมูลอ้างอิง:
-    {full_context}
-    
-    คำถาม: {question}
-    """
-    
-    model = genai.GenerativeModel(MODEL_NAME)
     try:
-        response = model.generate_content(
-            prompt, stream=True, generation_config=GENERATION_CONFIG
-        )
+        # เรียกใช้ฟังก์ชัน Safe Mode ที่เราเขียนเพิ่ม
+        response = _generate_content_safe(prompt, stream=True)
+        
         for chunk in response:
             if chunk.text: yield chunk.text
+            
     except Exception as e:
-        yield f"⚠️ Error: {str(e)}"
+        yield f"⚠️ ขออภัยครับ ระบบ AI ขัดข้องชั่วคราว (Quota Exceeded): {str(e)}"
 
 def reply_general_chat(query):
-    model = genai.GenerativeModel(MODEL_NAME)
-    response = model.generate_content(query)
-    return response.text
+    try:
+        # เรียกใช้ฟังก์ชัน Safe Mode แบบไม่ Stream
+        response = _generate_content_safe(query, stream=False)
+        return response.text
+    except Exception as e:
+        return f"⚠️ ระบบไม่สามารถตอบกลับได้ในขณะนี้: {e}"
