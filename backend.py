@@ -7,12 +7,15 @@ import time
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from google.api_core.exceptions import ResourceExhausted, InternalServerError # เพิ่มตัวนี้เข้ามา
+# Import Error เพื่อดักจับกรณีโมเดลมีปัญหา
+from google.api_core.exceptions import ResourceExhausted, InternalServerError, NotFound, GoogleAPICallError
 
 # ================= Config =================
-# โมเดลหลัก (เร็วแรง)
-PRIMARY_MODEL = 'gemini-2.0-flash-lite-preview-02-05' 
-# โมเดลสำรอง (เสถียร) - ใช้เมื่อตัวหลักโควตาเต็ม
+# ✅ ใช้ Gemini 2.0 Flash (ตัวล่าสุดของจริง เร็วที่สุดตอนนี้)
+# หมายเหตุ: ถ้าอนาคตมี 2.5 มาจริง ให้แก้ตรงนี้เป็น 'gemini-2.5-flash' ได้เลย
+PRIMARY_MODEL = 'gemini-2.5-flash' 
+
+# ✅ ตัวสำรอง (Backup): ถ้าตัวบนพัง/โควตาเต็ม ให้ถอยมาใช้ตัวเสถียร
 BACKUP_MODEL = 'gemini-1.5-flash'
 
 GENERATION_CONFIG = {
@@ -31,11 +34,17 @@ def get_drive_service():
         if "google_json" not in st.secrets:
             st.error("❌ ไม่พบ 'google_json' ใน Secrets")
             return None
+            
+        # แปลง String JSON ให้เป็น Dictionary
         creds_info = json.loads(st.secrets["google_json"])
+        
         creds = service_account.Credentials.from_service_account_info(
             creds_info, scopes=['https://www.googleapis.com/auth/drive.readonly']
         )
         return build('drive', 'v3', credentials=creds)
+    except json.JSONDecodeError:
+        st.error("❌ รูปแบบ JSON ใน Secrets ผิดพลาด (เช็คตัวอักษรพิเศษหรือการกด Enter)")
+        return None
     except Exception as e:
         st.error(f"❌ เชื่อมต่อ Drive ไม่สำเร็จ: {e}")
         return None
@@ -72,22 +81,21 @@ def find_relevant_files(root_folder_id, user_query):
     
     province_map = get_province_map(root_folder_id)
     target_folder_ids = []
-    detected_provinces = []
     
+    # Logic: หาชื่อจังหวัดในคำถาม
     for prov_name, prov_id in province_map.items():
         if prov_name in user_query:
             target_folder_ids.append(prov_id)
-            detected_provinces.append(prov_name)
     
     files_found = []
     if target_folder_ids:
-        # st.toast(f"📍 เจอจังหวัด: {', '.join(detected_provinces)}")
+        # เจอจังหวัด -> ค้นในโฟลเดอร์จังหวัดนั้น
         for fid in target_folder_ids:
             q = f"'{fid}' in parents and mimeType = 'text/plain' and trashed = false"
             res = service.files().list(q=q, pageSize=10, fields="files(id, name)").execute()
             files_found.extend(res.get('files', []))
     else:
-        # st.toast("🔎 ค้นหาจากชื่อไฟล์...")
+        # ไม่เจอจังหวัด -> ค้นหาจากชื่อไฟล์ (Keyword Search)
         clean_query = user_query.replace("ราคา", "").replace("ข้อมูล", "").strip()
         if clean_query:
             q = f"name contains '{clean_query}' and mimeType = 'text/plain' and trashed = false"
@@ -96,20 +104,20 @@ def find_relevant_files(root_folder_id, user_query):
 
     return files_found
 
-# ================= Helper: เรียก Gemini แบบปลอดภัย =================
+# ================= Helper: เรียก Gemini แบบปลอดภัย (Safe Mode) =================
 def _generate_content_safe(prompt, stream=False):
     """
-    ฟังก์ชันนี้จะลองใช้รุ่น Lite ก่อน ถ้าโควตาเต็ม จะสลับไปใช้รุ่นปกติให้อัตโนมัติ
+    ระบบอัจฉริยะ: ลองใช้ 2.0 Flash ก่อน ถ้าไม่ได้ จะสลับไป 1.5 Flash ให้อัตโนมัติ
     """
     try:
-        # รอบที่ 1: ลองใช้รุ่น Lite (เร็วสุด)
+        # รอบที่ 1: ลองใช้รุ่น PRIMARY (Gemini 2.0 Flash)
         model = genai.GenerativeModel(PRIMARY_MODEL)
         return model.generate_content(prompt, stream=stream, generation_config=GENERATION_CONFIG)
     
-    except (ResourceExhausted, InternalServerError):
-        # รอบที่ 2: ถ้า Error (โควตาเต็ม/ล่ม) -> สลับไปใช้รุ่น Backup
-        # st.toast("⚠️ รุ่น Lite โควตาเต็ม กำลังสลับไปใช้รุ่นมาตรฐาน...", icon="🔄")
-        time.sleep(1) # พักหายใจ 1 วิ
+    except (ResourceExhausted, InternalServerError, NotFound, ValueError, GoogleAPICallError) as e:
+        # รอบที่ 2: ถ้า Error (หาโมเดลไม่เจอ / โควตาเต็ม) -> สลับไปใช้รุ่น BACKUP
+        # print(f"Switching model due to error: {e}") # (Debug ใน Console)
+        time.sleep(1) # พัก 1 วิ
         model = genai.GenerativeModel(BACKUP_MODEL)
         return model.generate_content(prompt, stream=stream, generation_config=GENERATION_CONFIG)
 
@@ -117,9 +125,10 @@ def _generate_content_safe(prompt, stream=False):
 def ask_gemini_stream(file_list, question, timer_placeholder=None):
     service = get_drive_service()
     if not file_list:
-        yield "ไม่พบเอกสารที่ตรงกับคำค้นหาในโฟลเดอร์ครับ"
+        yield "ไม่พบเอกสารที่ตรงกับคำค้นหาในโฟลเดอร์ครับ (ลองระบุชื่อจังหวัดให้ชัดเจน)"
         return
 
+    # Parallel Download (โหลดไฟล์พร้อมกัน เร็วปรู๊ด)
     downloaded_texts = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_file = {
@@ -133,18 +142,16 @@ def ask_gemini_stream(file_list, question, timer_placeholder=None):
     prompt = f"Context:\n{full_context}\n\nQuestion: {question}\nAnswer based on context:"
     
     try:
-        # เรียกใช้ฟังก์ชัน Safe Mode ที่เราเขียนเพิ่ม
+        # เรียกใช้ฟังก์ชัน Safe Mode
         response = _generate_content_safe(prompt, stream=True)
-        
         for chunk in response:
             if chunk.text: yield chunk.text
             
     except Exception as e:
-        yield f"⚠️ ขออภัยครับ ระบบ AI ขัดข้องชั่วคราว (Quota Exceeded): {str(e)}"
+        yield f"⚠️ ขออภัยครับ ระบบ AI ขัดข้องชั่วคราว: {str(e)}"
 
 def reply_general_chat(query):
     try:
-        # เรียกใช้ฟังก์ชัน Safe Mode แบบไม่ Stream
         response = _generate_content_safe(query, stream=False)
         return response.text
     except Exception as e:
