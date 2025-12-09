@@ -5,7 +5,7 @@ import google.generativeai as genai
 import concurrent.futures
 import streamlit as st
 
-# ตั้งค่าโมเดล: เปลี่ยนเป็น 'Lite' เพื่อความเร็วสูงสุด (Latency ต่ำสุด)
+# ตั้งค่าโมเดล: ใช้ Flash Lite เพื่อความเร็ว
 MODEL_NAME = 'gemini-2.5-flash-lite'
 
 # ตั้งค่า Safety Settings
@@ -16,30 +16,30 @@ SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
 
-# ตั้งค่า Generation Config เพื่อเร่งความเร็วการตอบ
+# ตั้งค่า Generation Config
 GENERATION_CONFIG = {
-    "temperature": 0.3, # เพิ่มนิดหน่อยให้ภาษาดูเป็นธรรมชาติขึ้น แต่ยังคงความเร็ว
+    "temperature": 0.3,
     "top_p": 0.8,
     "top_k": 40,
     "max_output_tokens": 8192,
 }
 
 def setup_api(api_key):
-    """ตั้งค่า API Key และทำความสะอาด Key"""
+    """ตั้งค่า API Key"""
     clean_key = api_key.strip()
     os.environ["GOOGLE_API_KEY"] = clean_key
     genai.configure(api_key=clean_key)
 
+# ================= Smart Search (Logic เดิมเอาไว้ Fallback) =================
 def find_relevant_files(root_folder, user_query):
     """
-    ระบบค้นหาไฟล์อัจฉริยะ (Smart Search Logic)
+    ระบบค้นหาไฟล์สำรอง (กรณีไม่เจอจังหวัด หรือค้นหาภาพรวม)
     """
     found_files_map = {} 
     query_normalized = user_query.lower()
     
-    # คำศัพท์ Trigger
     trigger_words = [
-        "ทุกจังหวัด", "ทั้งหมด", "ทุกที่", "all provinces", "15 จังหวัด", "ทั่วประเทศ", "ภาพรวม",
+        "ทุกจังหวัด", "ทั้งหมด", "ทุกที่", "all provinces", "17 จังหวัด", "ทั่วประเทศ", "ภาพรวม",
         "จังหวัดไหน", "จังหวัดใด", "ที่ไหน", "อันดับ", "มากที่สุด", "น้อยที่สุด", "เปรียบเทียบ", "top", "rank",
         "จังหวัดอะไร", "อะไรบ้าง", "ที่ไหนบ้าง", "กี่จังหวัด",
         "แต่ละ", "รายจังหวัด", "แยกจังหวัด", "สรุป", "จำนวน", "มูลค่า", "รายได้", "แนวโน้ม", "สถิติ", "เฉลี่ย"
@@ -47,7 +47,7 @@ def find_relevant_files(root_folder, user_query):
     
     is_search_all_trigger = any(trigger in query_normalized for trigger in trigger_words)
 
-    # สแกนหาชื่อจังหวัดในคำถาม
+    # สแกนหาชื่อจังหวัดในคำถามเพื่อช่วยกรอง
     try:
         mentioned_provinces = []
         with os.scandir(root_folder) as entries:
@@ -57,7 +57,6 @@ def find_relevant_files(root_folder, user_query):
     except Exception:
         mentioned_provinces = []
 
-    # เริ่มวนลูปค้นหา
     for dirpath, dirnames, filenames in os.walk(root_folder):
         folder_name = os.path.basename(dirpath).lower()
         should_check_folder = False
@@ -72,24 +71,21 @@ def find_relevant_files(root_folder, user_query):
             best_file = None
             max_score = 0
             
-            pdf_files = [f for f in filenames if f.lower().endswith(".pdf")]
+            # เน้นหา PDF ก่อน หรือไฟล์ Excel/CSV
+            target_exts = [".pdf", ".xlsx", ".csv", ".txt"]
+            candidate_files = [f for f in filenames if any(f.lower().endswith(ext) for ext in target_exts)]
             
-            for filename in pdf_files:
+            for filename in candidate_files:
                 file_name_no_ext = os.path.splitext(filename)[0].lower()
-                file_keywords = file_name_no_ext.replace("_", " ").replace("-", " ").split()
-                file_keywords.append(file_name_no_ext) 
-
+                # Logic การให้คะแนนไฟล์อย่างง่าย
                 current_score = 0
-                for kw in file_keywords:
-                    if len(kw) < 2 or kw in trigger_words: continue 
-                    if kw in query_normalized: current_score += 50 
+                if filename in query_normalized: current_score += 100
+                if "สรุป" in filename or "report" in filename: current_score += 10
+                
+                # ถ้าเจาะจงจังหวัด ให้คะแนนไฟล์ในจังหวัดนั้นสูง
+                if folder_name in query_normalized: current_score += 50
 
-                if current_score == 0:
-                    generic = ["ข้อมูลพื้นฐาน", "ข้อมูลทั่วไป", "รายงาน", "สรุป", "report", "basic", "profile", "data", "สถิติ", "ประจำปี"]
-                    if any(t in file_name_no_ext for t in generic) or len(pdf_files) == 1:
-                        current_score = 5
-
-                if current_score > 0 and current_score >= max_score:
+                if current_score >= max_score:
                     max_score = current_score
                     best_file = os.path.join(dirpath, filename)
             
@@ -98,8 +94,8 @@ def find_relevant_files(root_folder, user_query):
 
     return list(found_files_map.values())
 
-# --- ส่วนสำคัญที่เพิ่มความเร็ว: CACHING ---
-@st.cache_resource(show_spinner=False, ttl=3600) # เก็บ Cache ไว้นาน 1 ชั่วโมง
+# ================= Caching Upload =================
+@st.cache_resource(show_spinner=False, ttl=3600)
 def _upload_single_cached(path, last_modified_time):
     """
     ฟังก์ชันอัปโหลดที่มีการจำค่า (Cache)
@@ -111,7 +107,7 @@ def _upload_single_cached(path, last_modified_time):
         # รอ Processing
         retry_count = 0
         while uf.state.name == "PROCESSING":
-            time.sleep(1) # รอ 1 วินาที
+            time.sleep(1)
             uf = genai.get_file(uf.name)
             retry_count += 1
             if retry_count > 60:
@@ -122,17 +118,21 @@ def _upload_single_cached(path, last_modified_time):
         print(f"Error uploading {path}: {e}")
         return None
 
-def ask_gemini_stream(file_paths, question):
+# ================= Main Gemini Function =================
+def ask_gemini_stream(file_paths, question, timer_placeholder=None, start_time=None):
     """
-    อัปโหลดไฟล์ (Parallel Max Power) -> ตอบแบบ Streaming
+    อัปโหลดไฟล์ -> ตอบแบบ Streaming
+    รองรับ timer_placeholder เพื่ออัปเดตเวลาหน้าเว็บ
     """
     uploaded_files = []
     total = len(file_paths)
     
-    # 1. Parallel Upload (ใช้ 15 threads เพื่อความเร็วสูงสุด)
-    progress_bar = st.progress(0, text=f"🚀 เร่งความเร็วสูงสุด! กำลังเตรียมไฟล์ {total} รายการ...")
+    # 1. Parallel Upload
+    # แสดง Progress bar เฉพาะตอนอัปโหลด
+    progress_text = f"🚀 กำลังเตรียมข้อมูล {total} ไฟล์..."
+    progress_bar = st.progress(0, text=progress_text)
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_map = {}
         for path in file_paths:
             try:
@@ -147,39 +147,47 @@ def ask_gemini_stream(file_paths, question):
             res = future.result()
             if res: uploaded_files.append(res)
             done += 1
-            progress_bar.progress(done / total, text=f"โหลดเสร็จแล้ว {done}/{total} ไฟล์ (Cache Active ⚡)")
+            
+            # อัปเดต Progress Bar
+            progress_bar.progress(done / total, text=f"อ่านข้อมูลแล้ว {done}/{total} ไฟล์ (Cache Active ⚡)")
+            
+            # อัปเดตตัวจับเวลา (ถ้าส่งมา)
+            if timer_placeholder and start_time:
+                elapsed = time.time() - start_time
+                timer_placeholder.markdown(f"**⏱️ เวลาที่ใช้ไป: {elapsed:.1f} วินาที** (กำลังอ่านไฟล์...)")
     
-    progress_bar.empty()
+    progress_bar.empty() # ลบ Progress bar ออกเมื่อเสร็จ
 
     if not uploaded_files:
         yield "❌ ไม่สามารถอ่านไฟล์ได้เลยครับ (Upload Failed)"
         return
 
-    # 2. Prompt (กระชับขึ้นเพื่อลดเวลาประมวลผล)
+    # 2. Prompt Construction
     model = genai.GenerativeModel(MODEL_NAME)
     payload = uploaded_files + [
         f"""
-        Context: Data Analyst for 15 provinces agriculture/coop data.
-        Task: Answer question based ONLY on attached files ({len(uploaded_files)} files).
+        Role: Agricultural Data Specialist for Thailand (17 Provinces).
+        Task: Analyze the provided documents to answer the question accurately.
         
-        Strict Rules:
-        1. NO external knowledge.
-        2. Convert Thai numerals (๑-๙) to Arabic (1-9).
-        3. Use tables/lists for comparisons.
-        4. Cite province names.
-        5. Say "ไม่พบข้อมูล" if missing.
+        Question: "{question}"
         
-        Question: {question}
+        Guidelines:
+        - Answer based ONLY on the provided files.
+        - If the user asks about a specific province (e.g., Tak), focus heavily on the files from that folder.
+        - Use Thai language.
+        - Convert Thai numerals (๑-๙) to Arabic (1-9).
+        - If comparing data, use a Table or Bullet points.
+        - If data is missing, state clearly "ไม่พบข้อมูลในเอกสาร".
         """
     ]
 
-    # 3. Streaming Response (เพิ่ม config เพื่อความเร็ว)
+    # 3. Streaming Response
     try:
         response = model.generate_content(
             payload, 
             stream=True, 
             safety_settings=SAFETY_SETTINGS,
-            generation_config=GENERATION_CONFIG # <--- ใส่ Config เร่งความเร็วตรงนี้
+            generation_config=GENERATION_CONFIG
         )
         for chunk in response:
             if chunk.text:
@@ -187,6 +195,7 @@ def ask_gemini_stream(file_paths, question):
     except Exception as e:
         yield f"⚠️ เกิดข้อผิดพลาดในการสร้างคำตอบ: {str(e)}"
 
+# ================= General Chat =================
 def reply_general_chat(user_query):
     """
     ฟังก์ชันคุยเล่น (เมื่อหาไฟล์ไม่เจอ)
@@ -200,8 +209,8 @@ def reply_general_chat(user_query):
         
         คำสั่ง:
         1. หากเป็นการทักทาย/ถามเวลา: ตอบกลับสุภาพ (เวลา: {now})
-        2. หากถามข้อมูลตัวเลข/สถิติ: ตอบว่า "ไม่พบไฟล์เอกสารในระบบ Drive กรุณาระบุชื่อจังหวัดหรือหัวข้อให้ชัดเจน"
-           
+        2. หากถามข้อมูลตัวเลข/สถิติ: ตอบว่า "ไม่พบไฟล์เอกสารในระบบ Drive หรือไม่ได้ระบุจังหวัด กรุณาระบุชื่อจังหวัดให้ชัดเจนครับ"
+            
         User: {user_query}
         """
         
