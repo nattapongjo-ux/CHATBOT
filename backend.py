@@ -15,9 +15,6 @@ from google.api_core.exceptions import ResourceExhausted, InternalServerError, N
 # หมายเหตุ: ถ้าอนาคตมี 2.5 มาจริง ให้แก้ตรงนี้เป็น 'gemini-2.5-flash' ได้เลย
 PRIMARY_MODEL = 'gemini-2.5-flash' 
 
-# ✅ ตัวสำรอง (Backup): ถ้าตัวบนพัง/โควตาเต็ม ให้ถอยมาใช้ตัวเสถียร
-BACKUP_MODEL = 'gemini-1.5-flash'
-
 GENERATION_CONFIG = {
     "temperature": 0.3,
     "top_p": 0.8,
@@ -156,3 +153,4 @@ def reply_general_chat(query):
         return response.text
     except Exception as e:
         return f"⚠️ ระบบไม่สามารถตอบกลับได้ในขณะนี้: {e}"
+
