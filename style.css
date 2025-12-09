@@ -1,0 +1,57 @@
+/* นำเข้าฟอนต์ภาษาไทยสวยๆ */
+@import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600&display=swap');
+
+/* บังคับใช้ฟอนต์ */
+html, body, [class*="css"] {
+    font-family: 'Sarabun', sans-serif;
+}
+
+/* หัวข้อหลัก */
+.main-title {
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: #1565C0; /* สีน้ำเงินเข้ม */
+    text-align: center;
+    margin-bottom: 5px;
+}
+
+.sub-title {
+    font-size: 1rem;
+    color: #666;
+    text-align: center;
+    margin-bottom: 25px;
+}
+
+/* ตกแต่งกล่องข้อความ Chat */
+.stChatMessage {
+    background-color: #f1f3f4;
+    border-radius: 15px;
+    padding: 15px;
+    margin-bottom: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    color: #000000 !important; /* บังคับตัวหนังสือสีดำ แก้ปัญหา Dark Mode */
+}
+
+/* ข้อความของผู้ใช้ (User) */
+div[data-testid="stChatMessage"]:nth-child(odd) {
+    background-color: #e3f2fd; /* สีฟ้าอ่อน */
+    border-left: 5px solid #2196F3;
+    color: #000000 !important;
+}
+
+/* ข้อความของบอท (Assistant) */
+div[data-testid="stChatMessage"]:nth-child(even) {
+    background-color: #ffffff; /* สีขาว */
+    border-left: 5px solid #4CAF50;
+    color: #000000 !important;
+}
+
+/* ซ่อนส่วนที่ไม่จำเป็นของ Streamlit */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+
+/* แต่งหลอดโหลด */
+.stProgress > div > div > div > div {
+    background-image: linear-gradient(to right, #2196F3, #64B5F6);
+}
