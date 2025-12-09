@@ -1,19 +1,73 @@
-import streamlit as st
+import google.generativeai as genai
 import os
-import time
-import backend
+import streamlit as st
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io
 
-# =================ตั้งค่าระบบ (Config)=================
-# โหลดค่าจาก st.secrets แทนการพิมพ์ตรงๆ
-try:
-    API_KEY = st.secrets["API_KEY"]
-    DATA_PATH = st.secrets["DATA_PATH"]
-except FileNotFoundError:
-    st.error("❌ ไม่พบไฟล์ secrets.toml กรุณาสร้างไฟล์ .streamlit/secrets.toml ก่อนเริ่มใช้งาน")
-    st.stop()
-except KeyError as e:
-    st.error(f"❌ ไม่พบค่า {e} ในไฟล์ secrets.toml")
-    st.stop()
+# ... (ฟังก์ชัน setup_api ของเดิมใช้ได้) ...
+
+def get_drive_service():
+    """สร้างการเชื่อมต่อกับ Google Drive"""
+    try:
+        # อ่าน JSON จาก Secrets ที่เราแปะไว้
+        creds_info = json.loads(st.secrets["google_json"])
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        st.error(f"เชื่อมต่อ Drive ไม่สำเร็จ: {e}")
+        return None
+
+def download_file_content(file_id, service):
+    """โหลดเนื้อหาไฟล์จาก Drive มาเป็น Text"""
+    try:
+        request = service.files().get_media(fileId=file_id)
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+        
+        # แปลงข้อมูลเป็น Text (รองรับภาษาไทย utf-8)
+        return file_io.getvalue().decode('utf-8')
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+def find_relevant_files(folder_link_or_id, user_query):
+    """
+    ค้นหาไฟล์ใน Drive (แก้จากเวอร์ชั่นเดิมที่ค้นในโฟลเดอร์เครื่อง)
+    *หมายเหตุ: folder_link_or_id ในที่นี้ไม่ได้ใช้แล้ว เพราะเราจะค้นทั้ง Drive ที่บอทเห็น
+    หรือถ้าจะเจาะจงโฟลเดอร์ ต้องเอา Folder ID มาใส่
+    """
+    service = get_drive_service()
+    if not service:
+        return []
+
+    # ค้นหาไฟล์ text ทั้งหมดที่บอทมองเห็น
+    # (ถ้าไฟล์เยอะมาก อาจต้องระบุ parent folder id เพิ่มใน query)
+    results = service.files().list(
+        q="mimeType = 'text/plain' and name contains '.txt'", 
+        pageSize=10, fields="nextPageToken, files(id, name)"
+    ).execute()
+    
+    items = results.get('files', [])
+    
+    # กรองไฟล์เบื้องต้น (Logic ง่ายๆ ถ้าชื่อไฟล์ตรงกับคำค้น)
+    # ในความเป็นจริงควรใช้วิธี Search ที่ฉลาดกว่านี้ หรือโหลดมาเช็คเนื้อหา
+    relevant_files = []
+    
+    # ⚠️ เพื่อความง่าย: โค้ดนี้จะโหลดเนื้อหา "ทุกไฟล์" ที่เจอมาส่งให้ AI
+    # (ถ้าไฟล์เยอะต้องปรับปรุง Logic นี้)
+    for item in items:
+        content = download_file_content(item['id'], service)
+        relevant_files.append(content)
+        
+    return relevant_files
 
 # ตั้งค่าหน้าเว็บ
 st.set_page_config(page_title="Agricultural Data AI", page_icon="🌾", layout="wide")
@@ -152,4 +206,5 @@ if prompt := st.chat_input("ถามข้อมูลได้เลย... (�
                 reply = backend.reply_general_chat(prompt)
             
             st.markdown(reply)
+
             st.session_state.messages.append({"role": "assistant", "content": reply})
